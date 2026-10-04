@@ -5,7 +5,8 @@ Script para descargar skills específicos para opencode desde GitHub.
 ## Instalación
 
 ```bash
-sudo cp skilldown /usr/local/bin
+wget https://raw.githubusercontent.com/ManzDev/skilldown/main/skilldown
+sudo mv skilldown /usr/local/bin
 sudo chmod +x /usr/local/bin/skilldown
 ```
 
