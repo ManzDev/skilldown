@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    echo "Uso: skilldown [--global] [--verbose] <github-url>"
+    echo
+    echo "Opciones:"
+    echo "  --global    Instalar en ~/.config/opencode/skills/"
+    echo "  --verbose   Mostrar los ficheros descargados"
+    echo
+    echo "Ejemplos:"
+    echo "  skilldown https://github.com/user/repo"
+    echo "  skilldown https://github.com/user/repo/tree/main/skills/foo"
+    echo "  skilldown --global https://github.com/user/repo"
+    echo "  skilldown --verbose https://github.com/user/repo"
+}
+
+GLOBAL=false
+VERBOSE=false
+
+# ----------------------------------------------------------------------
+# Procesar opciones
+# ----------------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --global)
+            GLOBAL=true
+            shift
+            ;;
+
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+
+        --help|-h)
+            usage
+            exit 0
+            ;;
+
+        -*)
+            echo "Error: opción desconocida: $1" >&2
+            echo >&2
+            usage >&2
+            exit 1
+            ;;
+
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 1
+fi
+
+URL="${1%/}"
+
+# ----------------------------------------------------------------------
+# Dependencias
+# ----------------------------------------------------------------------
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl no está instalado." >&2
+    exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq no está instalado." >&2
+    exit 1
+fi
+
+# ----------------------------------------------------------------------
+# Parsear URL de GitHub
+#
+# Soporta:
+#
+#   https://github.com/OWNER/REPO
+#   https://github.com/OWNER/REPO/tree/BRANCH
+#   https://github.com/OWNER/REPO/tree/BRANCH/path/to/skill
+#
+# ----------------------------------------------------------------------
+
+if [[ "$URL" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+
+    OWNER="${BASH_REMATCH[1]}"
+    REPO="${BASH_REMATCH[2]}"
+    REF=""
+    REPO_PATH=""
+
+elif [[ "$URL" =~ ^https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)(/(.*))?$ ]]; then
+
+    OWNER="${BASH_REMATCH[1]}"
+    REPO="${BASH_REMATCH[2]}"
+    REF="${BASH_REMATCH[3]}"
+    REPO_PATH="${BASH_REMATCH[5]:-}"
+
+else
+
+    echo "Error: URL de GitHub no válida:" >&2
+    echo "  $URL" >&2
+    exit 1
+
+fi
+
+# ----------------------------------------------------------------------
+# Construir URL de la API de GitHub
+# ----------------------------------------------------------------------
+
+API_URL="https://api.github.com/repos/${OWNER}/${REPO}/contents"
+
+if [[ -n "$REPO_PATH" ]]; then
+    API_URL="${API_URL}/${REPO_PATH}"
+fi
+
+if [[ -n "$REF" ]]; then
+    API_URL="${API_URL}?ref=${REF}"
+fi
+
+# ----------------------------------------------------------------------
+# Obtener contenido de la carpeta
+# ----------------------------------------------------------------------
+
+ENTRIES="$(
+    curl -fsSL \
+        -H 'Accept: application/vnd.github+json' \
+        "$API_URL"
+)" || {
+    echo "Error: no se pudo acceder a:" >&2
+    echo "  $URL" >&2
+    exit 1
+}
+
+# ----------------------------------------------------------------------
+# Comprobar que existe SKILL.md
+# ----------------------------------------------------------------------
+
+SKILL_ENTRY="$(
+    jq -c '
+        .[]
+        | select(.type == "file" and .name == "SKILL.md")
+    ' <<< "$ENTRIES"
+)"
+
+if [[ -z "$SKILL_ENTRY" ]]; then
+    echo "Error: la carpeta indicada no contiene SKILL.md." >&2
+    echo "  $URL" >&2
+    exit 1
+fi
+
+# ----------------------------------------------------------------------
+# Determinar nombre de la skill
+# ----------------------------------------------------------------------
+
+if [[ -n "$REPO_PATH" ]]; then
+    SKILL="${REPO_PATH##*/}"
+else
+    SKILL="$REPO"
+fi
+
+if [[ -z "$SKILL" || "$SKILL" == "." || "$SKILL" == ".." ]]; then
+    echo "Error: no se pudo determinar el nombre de la skill." >&2
+    exit 1
+fi
+
+# ----------------------------------------------------------------------
+# Determinar destino
+# ----------------------------------------------------------------------
+
+if $GLOBAL; then
+    DEST="$HOME/.config/opencode/skills/$SKILL"
+else
+    DEST=".opencode/skills/$SKILL"
+fi
+
+mkdir -p "$DEST"
+
+# ----------------------------------------------------------------------
+# Lista de ficheros
+#
+# Primero recorremos todo para conocer el número total.
+# ----------------------------------------------------------------------
+
+FILES=()
+
+add_files_from_directory() {
+    local api_url="$1"
+    local prefix="$2"
+
+    local entries
+    entries="$(
+        curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            "$api_url"
+    )"
+
+    while IFS= read -r entry; do
+
+        local type
+        local name
+        local child_api
+        local download_url
+
+        type="$(jq -r '.type' <<< "$entry")"
+        name="$(jq -r '.name' <<< "$entry")"
+        child_api="$(jq -r '.url // empty' <<< "$entry")"
+        download_url="$(jq -r '.download_url // empty' <<< "$entry")"
+
+        case "$type" in
+
+            file)
+                FILES+=("$download_url|$prefix/$name")
+                ;;
+
+            dir)
+                add_files_from_directory \
+                    "$child_api" \
+                    "$prefix/$name"
+                ;;
+
+        esac
+
+    done < <(jq -c '.[]' <<< "$entries")
+}
+
+# SKILL.md siempre se descarga.
+SKILL_URL="$(jq -r '.download_url' <<< "$SKILL_ENTRY")"
+
+FILES+=("$SKILL_URL|$DEST/SKILL.md")
+
+# Solo descargar estas tres carpetas.
+for DIR in references templates scripts; do
+
+    DIR_ENTRY="$(
+        jq -c \
+            --arg dir "$DIR" \
+            '.[] | select(.type == "dir" and .name == $dir)' \
+            <<< "$ENTRIES"
+    )"
+
+    if [[ -n "$DIR_ENTRY" ]]; then
+
+        DIR_API_URL="$(jq -r '.url' <<< "$DIR_ENTRY")"
+
+        add_files_from_directory \
+            "$DIR_API_URL" \
+            "$DEST/$DIR"
+
+    fi
+
+done
+
+TOTAL="${#FILES[@]}"
+
+if [[ "$TOTAL" -eq 0 ]]; then
+    echo "Error: no se encontraron ficheros para descargar." >&2
+    exit 1
+fi
+
+# ----------------------------------------------------------------------
+# Descargar ficheros
+# ----------------------------------------------------------------------
+
+CURRENT=0
+
+for FILE in "${FILES[@]}"; do
+
+    DOWNLOAD_URL="${FILE%%|*}"
+    DESTINATION="${FILE#*|}"
+
+    CURRENT=$((CURRENT + 1))
+
+    mkdir -p "$(dirname "$DESTINATION")"
+
+    curl -fsSL \
+        -H 'Accept: application/vnd.github+json' \
+        "$DOWNLOAD_URL" \
+        -o "$DESTINATION"
+
+    if $VERBOSE; then
+
+        printf '%s\n' \
+            "($CURRENT/$TOTAL) $DESTINATION"
+
+    else
+
+        printf '\r\033[KDescargando (%d/%d) ...' \
+            "$CURRENT" \
+            "$TOTAL"
+
+    fi
+
+done
+
+# ----------------------------------------------------------------------
+# Resultado
+# ----------------------------------------------------------------------
+
+if ! $VERBOSE; then
+    printf '\n'
+fi
+
+echo "✓ Skill '$SKILL' instalada: $TOTAL ficheros"
+echo "  $DEST"
